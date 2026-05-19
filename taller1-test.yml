@@ -1,332 +1,594 @@
+# =============================================================================
+# CURSO: MTIC206 — Taller 1
+# NOMBRE: Infraestructura de Red VPC Segura en AWS
+# DESCRIPCION: Este template de CloudFormation crea una arquitectura de red
+#              completa y segura en AWS, incluyendo VPC, subredes publicas y
+#              privadas, Internet Gateway, NAT Gateway, tablas de rutas, NACLs,
+#              Grupos de Seguridad, instancias EC2 (incluyendo un Bastion Host)
+#              y roles/politicas de IAM.
+#
+# OBJETIVO DE APRENDIZAJE:
+#   Entender como se modela infraestructura como codigo (IaC) usando
+#   CloudFormation, y como se disena una red segura en AWS con acceso
+#   controlado a instancias privadas a traves de un Bastion Host.
+#
+# ARQUITECTURA:
+#   Internet ──► Internet Gateway ──► Subred Publica 1 (Bastion Host)
+#                                 └── Subred Publica 2 (Servidor Publico)
+#   Subred Privada 1 & 2 ──► NAT Gateway ──► Internet (solo salida)
+#   Acceso SSH a privadas: solo desde el Bastion Host
+#
+# NOTA IMPORTANTE:
+#   Antes de desplegar, necesitas tener creado un Key Pair en EC2.
+#   Si no tenes uno, crealo en: EC2 → Key Pairs → Create key pair
+#   Guarda el archivo .pem en tu computadora.
+# =============================================================================
+
 AWSTemplateFormatVersion: 2010-09-09
-Description: AWS CFT corregido para compatibilidad estricta con AWS CloudFormation Designer (Lienzo) sin errores de UserData.
 
-# ==============================================================================
-# SECCIÓN DE PARÁMETROS
-# ==============================================================================
+Description: >
+  MTIC206 Taller 1 — Crea una red VPC completa y segura con subredes publicas
+  y privadas, NAT Gateway, Internet Gateway, NACLs, Grupos de Seguridad,
+  un Bastion Host, instancias EC2 y un rol IAM con acceso a S3.
+
+
+# =============================================================================
+# SECCION: Metadata
+# USO: Organiza visualmente los parametros en la consola de CloudFormation.
+#      Cuando alguien despliega este template desde la consola de AWS,
+#      los parametros aparecen agrupados de forma logica en lugar de
+#      aparecer todos juntos sin orden.
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Red — Configuracion de VPC"
+        Parameters:
+          - VpcCIDR
+          - SubredPublica1CIDR
+          - SubredPublica2CIDR
+          - SubredPrivada1CIDR
+          - SubredPrivada2CIDR
+      - Label:
+          default: "Computo — Configuracion de EC2"
+        Parameters:
+          - TipoDeInstancia
+          - AmiID
+          - NombreDelKeyPair
+      - Label:
+          default: "General — Etiquetas y nombres"
+        Parameters:
+          - Etiqueta
+          - SufijoGrupoSeguridad
+    ParameterLabels:
+      VpcCIDR:
+        default: "Rango de IPs para la VPC (CIDR)"
+      SubredPublica1CIDR:
+        default: "CIDR de Subred Publica 1 (Zona A)"
+      SubredPublica2CIDR:
+        default: "CIDR de Subred Publica 2 (Zona B)"
+      SubredPrivada1CIDR:
+        default: "CIDR de Subred Privada 1 (Zona A)"
+      SubredPrivada2CIDR:
+        default: "CIDR de Subred Privada 2 (Zona B)"
+      TipoDeInstancia:
+        default: "Tipo de instancia EC2"
+      AmiID:
+        default: "ID de la AMI (imagen del sistema operativo)"
+      NombreDelKeyPair:
+        default: "Nombre del Key Pair para SSH"
+      Etiqueta:
+        default: "Etiqueta para identificar los recursos"
+      SufijoGrupoSeguridad:
+        default: "Sufijo para el nombre de los Grupos de Seguridad"
+
+
+# =============================================================================
+# SECCION: Parameters (Parametros)
+# USO: Los parametros hacen que el template sea reutilizable. En lugar de
+#      escribir los valores directamente en el template (hardcoded), se
+#      definen aqui para que el usuario los ingrese o confirme al desplegar.
+#      Esto permite usar el mismo template para distintos entornos
+#      (desarrollo, produccion, etc.) con diferentes valores.
+# =============================================================================
 Parameters:
-  myTag:
-    Description: Etiqueta (Tag) principal para identificar todos los recursos
-    Type: String
-    Default: mi-taller-aws
 
+  # --------------------------------------------------------------------------
+  # Parametro: Etiqueta general
+  # Sirve para identificar todos los recursos de este taller en la consola.
+  # Cuando tenes muchos recursos en AWS, las etiquetas te ayudan a filtrarlos
+  # y saber a que proyecto pertenecen.
+  # --------------------------------------------------------------------------
+  Etiqueta:
+    Description: Etiqueta que se aplica a todos los recursos del taller
+    Type: String
+    Default: MTIC206-Taller1
+
+  # --------------------------------------------------------------------------
+  # Parametro: CIDR de la VPC
+  # El bloque CIDR define el rango de IPs privadas que tendra tu red.
+  # 10.0.0.0/16 significa que tenes 65,536 IPs disponibles (10.0.0.0 → 10.0.255.255)
+  # --------------------------------------------------------------------------
   VpcCIDR:
-    Description: Rango de IPs para toda la VPC (Notación CIDR)
+    Description: Rango de IPs (CIDR) para la VPC principal
     Type: String
     Default: 10.0.0.0/16
-  
-  PublicSubnet1CIDR:
-    Description: Rango de IPs para la Subred Pública en la Zona de Disponibilidad 1
-    Type: String
-    Default: 10.0.1.0/24
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Debe ser un CIDR valido, por ejemplo 10.0.0.0/16
 
-  PublicSubnet2CIDR:
-    Description: Rango de IPs para la Subred Pública en la Zona de Disponibilidad 2
+  # --------------------------------------------------------------------------
+  # Parametros: CIDRs de las subredes
+  # Cada subred es una division de la VPC. Las publicas tienen acceso directo
+  # a internet; las privadas solo pueden salir a internet a traves del NAT.
+  # Se crean en dos Zonas de Disponibilidad distintas para alta disponibilidad.
+  # --------------------------------------------------------------------------
+  SubredPublica1CIDR:
+    Description: CIDR para la Subred Publica en la primera Zona de Disponibilidad
     Type: String
-    Default: 10.0.2.0/24
+    Default: 10.0.1.0/24   # 256 IPs: 10.0.1.0 → 10.0.1.255
 
-  PrivateSubnet1CIDR:
-    Description: Rango de IPs para la Subred Privada en la Zona de Disponibilidad 1
+  SubredPublica2CIDR:
+    Description: CIDR para la Subred Publica en la segunda Zona de Disponibilidad
     Type: String
-    Default: 10.0.3.0/24
+    Default: 10.0.2.0/24   # 256 IPs: 10.0.2.0 → 10.0.2.255
 
-  PrivateSubnet2CIDR:
-    Description: Rango de IPs para la Subred Privada en la Zona de Disponibilidad 2
+  SubredPrivada1CIDR:
+    Description: CIDR para la Subred Privada en la primera Zona de Disponibilidad
     Type: String
-    Default: 10.0.4.0/24
+    Default: 10.0.3.0/24   # 256 IPs: 10.0.3.0 → 10.0.3.255
 
-  TypeOfInstance:
-    Description: "Especifica el tipo de instancia EC2 (Asegúrate que sea Capa Gratuita en tu región)"
+  SubredPrivada2CIDR:
+    Description: CIDR para la Subred Privada en la segunda Zona de Disponibilidad
+    Type: String
+    Default: 10.0.4.0/24   # 256 IPs: 10.0.4.0 → 10.0.4.255
+
+  # --------------------------------------------------------------------------
+  # Parametro: Tipo de instancia EC2
+  # Define el "tamano" de la maquina virtual (CPU, RAM).
+  # t3.micro es elegible para el nivel gratuito de AWS (Free Tier).
+  # Se usa t3 en lugar de t2 porque t3 es la generacion actual y mas eficiente.
+  # --------------------------------------------------------------------------
+  TipoDeInstancia:
+    Description: Tipo de instancia EC2 (t3.micro esta en el Free Tier)
     Type: String
     Default: t3.micro
     AllowedValues:
-      - t2.micro
-      - t3.micro
+      - t3.nano    # Muy pequena, para pruebas minimas
+      - t3.micro   # Pequena, suficiente para este taller y gratis en Free Tier
+      - t3.small   # Un poco mas grande si necesitas mas recursos
 
+  # --------------------------------------------------------------------------
+  # Parametro: AMI ID (imagen del sistema operativo)
+  # En lugar de escribir un ID de AMI especifico (que cambia por region y
+  # version), usamos el Parameter Store de SSM para obtener SIEMPRE la
+  # ultima version de Amazon Linux 2023 disponible en la region actual.
+  # Amazon Linux 2 (amzn2) llego a fin de vida en junio 2025, por eso
+  # ahora se usa Amazon Linux 2023 (al2023).
+  # --------------------------------------------------------------------------
   AmiID:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
-    Description: "El ID dinámico de la Amazon Machine Image (AMI)."
-    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+    Description: >
+      ID de la AMI. Usa el Parameter Store de SSM para obtener automaticamente
+      la ultima version de Amazon Linux 2023 en la region actual.
+      No necesitas cambiar este valor.
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
 
-  KeyPairName:
+  # --------------------------------------------------------------------------
+  # Parametro: Nombre del Key Pair
+  # El Key Pair es el par de llaves SSH que permite conectarse a las instancias.
+  # Usamos el tipo AWS::EC2::KeyPair::KeyName para que CloudFormation valide
+  # que el Key Pair existe en tu cuenta antes de crear el stack.
+  # IMPORTANTE: Crea tu Key Pair en EC2 antes de desplegar este template.
+  # --------------------------------------------------------------------------
+  NombreDelKeyPair:
     Type: AWS::EC2::KeyPair::KeyName
-    Description: Selecciona el nombre de tu par de claves (Key Pair) existente para conectarte por SSH.
+    Description: >
+      Nombre del Key Pair de EC2 existente para hacer SSH a las instancias.
+      Debe existir en tu cuenta de AWS en la region donde desplegas el stack.
 
-  SecurityGroupSuffix:
+  # --------------------------------------------------------------------------
+  # Parametro: Sufijo para grupos de seguridad
+  # Se usa para nombrar los grupos de seguridad, por ejemplo: "publico-sg"
+  # --------------------------------------------------------------------------
+  SufijoGrupoSeguridad:
     Type: String
-    Description: Sufijo para los nombres de los Grupos de Seguridad
+    Description: Sufijo que se agrega al nombre de los Grupos de Seguridad
     Default: sg
 
-# ==============================================================================
-# SECCIÓN DE RECURSOS
-# ==============================================================================
+
+# =============================================================================
+# SECCION: Resources (Recursos)
+# USO: Esta es la seccion principal del template. Aqui se definen TODOS
+#      los recursos de AWS que CloudFormation va a crear. Cada recurso tiene:
+#        - Un nombre logico (ej: MiVPC) que se usa dentro del template
+#        - Un Type que indica que servicio de AWS es
+#        - Properties que configuran como debe quedar el recurso
+#
+# ORDEN DE CREACION: CloudFormation analiza las dependencias entre recursos
+#      y los crea en el orden correcto. Si el recurso A necesita al recurso B,
+#      CloudFormation crea B primero, aunque A este escrito antes en el YAML.
+# =============================================================================
 Resources:
-  
-  MyVPC:
+
+  # ============================================================================
+  # BLOQUE 1: VPC (Virtual Private Cloud)
+  # ¿Que es? Una red virtual privada completamente aislada dentro de AWS.
+  # Es como tener tu propio centro de datos virtual en la nube.
+  # Todos los demas recursos de red se crean DENTRO de esta VPC.
+  # ============================================================================
+  MiVPC:
     Type: AWS::EC2::VPC
     Properties:
-      CidrBlock: !Ref VpcCIDR
-      EnableDnsSupport: true
-      EnableDnsHostnames: true
+      CidrBlock: !Ref VpcCIDR          # Rango de IPs de toda la red (ej: 10.0.0.0/16)
+      EnableDnsSupport: true            # Permite resolucion de nombres DNS dentro de la VPC
+      EnableDnsHostnames: true          # Las instancias reciben nombres DNS automaticamente
       Tags:
         - Key: Name
-          Value: MiVPC-Taller
-        - Key: myTag
-          Value: !Ref myTag
-  
-  ListS3BucketsRole:
+          Value: MTIC206-Taller1-VPC
+        - Key: Curso
+          Value: !Ref Etiqueta
+
+
+  # ============================================================================
+  # BLOQUE 2: IAM Role, Policy e Instance Profile
+  # ¿Que es? Los roles de IAM permiten que los servicios de AWS (como EC2)
+  # accedan a otros servicios (como S3) de forma segura, sin usar credenciales
+  # de usuario. Es la forma correcta de dar permisos a instancias EC2.
+  #
+  # Componentes:
+  #   - Role: Define quien puede asumir el rol (en este caso, EC2)
+  #   - Policy: Define que acciones estan permitidas (listar buckets de S3)
+  #   - Instance Profile: "Envuelve" el rol para que EC2 lo pueda usar
+  # ============================================================================
+
+  # Rol IAM que permite a EC2 asumir este rol
+  RolListarS3:
     Type: AWS::IAM::Role
     Properties:
+      RoleName: !Sub "MTIC206-Taller1-RolEC2-${AWS::StackName}"
+      Description: Permite a instancias EC2 listar buckets de S3
+      # AssumeRolePolicyDocument: define quien puede "asumir" (usar) este rol.
+      # En este caso, solo el servicio ec2.amazonaws.com puede usarlo.
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
-        - Effect: Allow
-          Principal:
-            Service:
-            - ec2.amazonaws.com
-          Action:
-          - sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com    # Solo instancias EC2 pueden asumir este rol
+            Action:
+              - sts:AssumeRole         # La accion que permite asumir el rol
       Path: "/"
-  
-  ListS3BucketsPolicy:
+      Tags:
+        - Key: Curso
+          Value: !Ref Etiqueta
+
+  # Politica IAM que define los permisos: solo listar buckets de S3
+  # El principio de menor privilegio indica dar solo los permisos necesarios.
+  PoliticaListarS3:
     Type: AWS::IAM::Policy
     Properties:
-      PolicyName: ListS3BucketsPolicy
+      PolicyName: MTIC206-Taller1-PoliticaListarS3
       PolicyDocument:
+        Version: '2012-10-17'
         Statement:
-        - Effect: Allow
-          Action:
-          - s3:List*
-          Resource: "*"
+          - Effect: Allow
+            Action:
+              - s3:List*               # Permite listar buckets y su contenido
+              - s3:GetBucketLocation   # Permite ver en que region esta el bucket
+            Resource: "*"              # Aplica a todos los buckets (en un entorno
+                                       # productivo seria mejor especificar el ARN exacto)
       Roles:
-      - Ref: ListS3BucketsRole
-  
-  ListS3BucketsInstanceProfile:
+        - !Ref RolListarS3             # Asocia esta politica al rol creado arriba
+
+  # Instance Profile: es el "contenedor" que permite asociar un rol IAM a EC2.
+  # EC2 no usa directamente un Role, sino un Instance Profile que contiene el Role.
+  PerfilInstancia:
     Type: AWS::IAM::InstanceProfile
     Properties:
       Path: "/"
       Roles:
-      - Ref: ListS3BucketsRole
+        - !Ref RolListarS3
 
-  PublicSubnet1:
+
+  # ============================================================================
+  # BLOQUE 3: Subredes (Subnets)
+  # ¿Que son? Divisiones de la VPC en segmentos mas pequenos.
+  # Se crean en dos Zonas de Disponibilidad (AZ) distintas para alta
+  # disponibilidad: si una zona falla, la otra sigue funcionando.
+  #
+  # Publicas: tienen IP publica asignada automaticamente (MapPublicIpOnLaunch)
+  #           y pueden comunicarse directamente con internet
+  # Privadas: NO tienen IP publica; solo pueden salir a internet a traves
+  #           del NAT Gateway (no pueden recibir conexiones del exterior)
+  # ============================================================================
+
+  # --- Subred Publica 1 (Primera Zona de Disponibilidad) ---
+  # Aqui vivira el Bastion Host y el NAT Gateway
+  SubredPublica1:
     Type: AWS::EC2::Subnet
     Properties:
-      VpcId: !Ref MyVPC
+      VpcId: !Ref MiVPC
+      # !Select [0, !GetAZs ''] obtiene la primera AZ disponible en la region actual
+      # Esto hace el template portable: funciona en us-east-1, us-west-2, etc.
       AvailabilityZone: !Select [ 0, !GetAZs '' ]
-      CidrBlock: !Ref PublicSubnet1CIDR
+      CidrBlock: !Ref SubredPublica1CIDR
+      MapPublicIpOnLaunch: true         # Las instancias aqui reciben IP publica automaticamente
+      Tags:
+        - Key: Name
+          Value: MTIC206-T1-Publica-1A
+        - Key: Tipo
+          Value: Publica
+        - Key: Curso
+          Value: !Ref Etiqueta
+
+  # --- Subred Publica 2 (Segunda Zona de Disponibilidad) ---
+  # Aqui vivira el Servidor Publico 2
+  SubredPublica2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MiVPC
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]  # Segunda AZ
+      CidrBlock: !Ref SubredPublica2CIDR
       MapPublicIpOnLaunch: true
       Tags:
         - Key: Name
-          Value: Public-1A
-        - Key: myTag
-          Value: !Ref myTag
+          Value: MTIC206-T1-Publica-2B
+        - Key: Tipo
+          Value: Publica
+        - Key: Curso
+          Value: !Ref Etiqueta
 
-  PublicSubnet2:
+  # --- Subred Privada 1 (Primera Zona de Disponibilidad) ---
+  # Aqui vivira el Servidor Privado 1
+  SubredPrivada1:
     Type: AWS::EC2::Subnet
     Properties:
-      VpcId: !Ref MyVPC
-      AvailabilityZone: !Select [ 1, !GetAZs  '' ]
-      CidrBlock: !Ref PublicSubnet2CIDR
-      MapPublicIpOnLaunch: true
+      VpcId: !Ref MiVPC
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      CidrBlock: !Ref SubredPrivada1CIDR
+      MapPublicIpOnLaunch: false        # Sin IP publica: solo IPs privadas
       Tags:
         - Key: Name
-          Value: Public-2A
-        - Key: myTag
-          Value: !Ref myTag
+          Value: MTIC206-T1-Privada-1A
+        - Key: Tipo
+          Value: Privada
+        - Key: Curso
+          Value: !Ref Etiqueta
 
-  PrivateSubnet1:
+  # --- Subred Privada 2 (Segunda Zona de Disponibilidad) ---
+  # Aqui vivira el Servidor Privado 2
+  SubredPrivada2:
     Type: AWS::EC2::Subnet
     Properties:
-      VpcId: !Ref MyVPC
-      AvailabilityZone: !Select [ 0, !GetAZs  '' ]
-      CidrBlock: !Ref PrivateSubnet1CIDR
+      VpcId: !Ref MiVPC
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      CidrBlock: !Ref SubredPrivada2CIDR
       MapPublicIpOnLaunch: false
       Tags:
         - Key: Name
-          Value: Private-1A
-        - Key: myTag
-          Value: !Ref myTag
+          Value: MTIC206-T1-Privada-2B
+        - Key: Tipo
+          Value: Privada
+        - Key: Curso
+          Value: !Ref Etiqueta
 
-  PrivateSubnet2:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref MyVPC
-      AvailabilityZone: !Select [ 1, !GetAZs  '' ]
-      CidrBlock: !Ref PrivateSubnet2CIDR
-      MapPublicIpOnLaunch: false
-      Tags:
-        - Key: Name
-          Value: Private-2A
-        - Key: myTag
-          Value: !Ref myTag
-  
-  MyIGW:
+
+  # ============================================================================
+  # BLOQUE 4: Internet Gateway (IGW)
+  # ¿Que es? La "puerta de entrada" de la VPC hacia internet.
+  # Sin el IGW, ningun recurso dentro de la VPC puede comunicarse con internet.
+  # Solo las subredes PUBLICAS usan el IGW (a traves de la tabla de rutas).
+  # Las privadas usan el NAT Gateway en cambio.
+  # ============================================================================
+
+  # Crea el Internet Gateway
+  MiIGW:
     Type: AWS::EC2::InternetGateway
     Properties:
       Tags:
         - Key: Name
-          Value: MyIGW
-        - Key: myTag
-          Value: !Ref myTag
+          Value: MTIC206-T1-IGW
+        - Key: Curso
+          Value: !Ref Etiqueta
 
-  MyIGWAttachment:
+  # Conecta (adjunta) el Internet Gateway a la VPC
+  # El IGW solo funciona cuando esta adjunto a una VPC.
+  # DependsOn no es necesario aqui porque CloudFormation detecta la dependencia
+  # automaticamente a traves del !Ref MiIGW y !Ref MiVPC.
+  ConexionIGWaVPC:
     Type: AWS::EC2::VPCGatewayAttachment
     Properties:
-      InternetGatewayId: !Ref MyIGW
-      VpcId: !Ref MyVPC
+      InternetGatewayId: !Ref MiIGW
+      VpcId: !Ref MiVPC
 
-  PublicRouteTable:
+
+  # ============================================================================
+  # BLOQUE 5: Tablas de Rutas (Route Tables)
+  # ¿Que son? Conjuntos de reglas que determinan hacia donde va el trafico.
+  # Cada subred debe estar asociada a una tabla de rutas.
+  #
+  # Tabla Publica: dirige el trafico hacia el Internet Gateway (acceso directo)
+  # Tabla Privada: dirige el trafico hacia el NAT Gateway (acceso indirecto)
+  # ============================================================================
+
+  # --- Tabla de Rutas Publica ---
+  TablaDeRutasPublica:
     Type: AWS::EC2::RouteTable
     Properties:
-      VpcId: !Ref MyVPC
+      VpcId: !Ref MiVPC
       Tags:
         - Key: Name
-          Value: Public_RT
-        - Key: myTag
-          Value: !Ref myTag
-  
-  MainRouteTableIGWAttachement:
+          Value: MTIC206-T1-RT-Publica
+        - Key: Curso
+          Value: !Ref Etiqueta
+
+  # Ruta en la tabla publica: todo el trafico (0.0.0.0/0) va al Internet Gateway
+  # 0.0.0.0/0 significa "cualquier destino que no este en la VPC local"
+  # DependsOn asegura que el IGW este adjunto ANTES de crear esta ruta
+  RutaPublicaHaciaIGW:
     Type: AWS::EC2::Route
-    DependsOn: MyIGWAttachment
+    DependsOn: ConexionIGWaVPC     # El IGW debe estar adjunto antes de crear la ruta
     Properties:
-      RouteTableId: !Ref PublicRouteTable
-      DestinationCidrBlock: 0.0.0.0/0
-      GatewayId: !Ref MyIGW
-  
-  PublicSubnet1RouteTableAssociation:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
-      RouteTableId: !Ref PublicRouteTable
-      SubnetId: !Ref PublicSubnet1
-  
-  PublicSubnet2RouteTableAssociation:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
-      RouteTableId: !Ref PublicRouteTable
-      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref TablaDeRutasPublica
+      DestinationCidrBlock: 0.0.0.0/0    # Todo el trafico que no sea local
+      GatewayId: !Ref MiIGW             # Sale por el Internet Gateway
 
-  PrivateRouteTable:
+  # Asociar Subred Publica 1 con la Tabla de Rutas Publica
+  AsociacionSubredPublica1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref TablaDeRutasPublica
+      SubnetId: !Ref SubredPublica1
+
+  # Asociar Subred Publica 2 con la Tabla de Rutas Publica
+  AsociacionSubredPublica2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref TablaDeRutasPublica
+      SubnetId: !Ref SubredPublica2
+
+  # --- Tabla de Rutas Privada ---
+  TablaDeRutasPrivada:
     Type: AWS::EC2::RouteTable
     Properties:
-      VpcId: !Ref MyVPC
+      VpcId: !Ref MiVPC
       Tags:
         - Key: Name
-          Value: Private_RT
-        - Key: myTag
-          Value: !Ref myTag
-  
-  PrivateSubnet1RouteTableAssociation:
+          Value: MTIC206-T1-RT-Privada
+        - Key: Curso
+          Value: !Ref Etiqueta
+
+  # Asociar Subred Privada 1 con la Tabla de Rutas Privada
+  AsociacionSubredPrivada1:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
-      RouteTableId: !Ref PrivateRouteTable
-      SubnetId: !Ref PrivateSubnet1
-  
-  PrivateSubnet2RouteTableAssociation:
+      RouteTableId: !Ref TablaDeRutasPrivada
+      SubnetId: !Ref SubredPrivada1
+
+  # Asociar Subred Privada 2 con la Tabla de Rutas Privada
+  AsociacionSubredPrivada2:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
-      RouteTableId: !Ref PrivateRouteTable
-      SubnetId: !Ref PrivateSubnet2
-  
-  NatGatewayEIP:
+      RouteTableId: !Ref TablaDeRutasPrivada
+      SubnetId: !Ref SubredPrivada2
+
+
+  # ============================================================================
+  # BLOQUE 6: Elastic IP y NAT Gateway
+  # ¿Que es el NAT Gateway? Permite que instancias en subredes PRIVADAS
+  # puedan SALIR a internet (para descargar actualizaciones, por ejemplo),
+  # pero impide que internet pueda ENTRAR a esas instancias directamente.
+  # Es como un proxy de salida unidireccional.
+  #
+  # El NAT Gateway necesita:
+  #   1. Una IP elastica (Elastic IP): IP publica fija asignada al NAT
+  #   2. Estar ubicado en una subred PUBLICA
+  # ============================================================================
+
+  # Elastic IP: una direccion IP publica estatica dedicada al NAT Gateway.
+  # DependsOn asegura que el IGW este adjunto (necesario para usar EIPs en VPC)
+  IPElasticaNAT:
     Type: AWS::EC2::EIP
-    DependsOn: MyIGWAttachment
+    DependsOn: ConexionIGWaVPC
     Properties:
-      Domain: vpc
+      Domain: vpc          # Indica que esta EIP es para uso dentro de una VPC
       Tags:
         - Key: Name
-          Value: MyNAT-EIP
-        - Key: myTag
-          Value: !Ref myTag
-  
-  MyNatGateway:
+          Value: MTIC206-T1-EIP-NAT
+        - Key: Curso
+          Value: !Ref Etiqueta
+
+  # NAT Gateway: va en la Subred Publica 1
+  # Las instancias privadas envian trafico al NAT, y el NAT lo reenvia a internet
+  # usando la IP Elastica. Las respuestas regresan al NAT, que las pasa a la instancia.
+  MiNATGateway:
     Type: AWS::EC2::NatGateway
     Properties:
-      AllocationId: !GetAtt NatGatewayEIP.AllocationId
-      SubnetId: !Ref PublicSubnet1
-  
-  PrivateRouteAssociateNAT:
+      AllocationId: !GetAtt IPElasticaNAT.AllocationId  # Asocia la Elastic IP al NAT
+      SubnetId: !Ref SubredPublica1                      # El NAT vive en la subred publica
+      Tags:
+        - Key: Name
+          Value: MTIC206-T1-NAT
+        - Key: Curso
+          Value: !Ref Etiqueta
+
+  # Ruta en la tabla privada: todo el trafico de las privadas va al NAT Gateway
+  RutaPrivadaHaciaNAT:
     Type: AWS::EC2::Route
     Properties:
-      RouteTableId: !Ref PrivateRouteTable
-      DestinationCidrBlock: 0.0.0.0/0
-      NatGatewayId: !Ref MyNatGateway
-  
-  MyPublicNACL:
+      RouteTableId: !Ref TablaDeRutasPrivada
+      DestinationCidrBlock: 0.0.0.0/0     # Todo el trafico de salida
+      NatGatewayId: !Ref MiNATGateway     # Pasa por el NAT Gateway
+
+
+  # ============================================================================
+  # BLOQUE 7: Network ACLs (NACLs)
+  # ¿Que son? Listas de control de acceso a nivel de SUBRED.
+  # Son como un firewall para toda la subred, ANTES de que el trafico llegue
+  # a las instancias individuales.
+  #
+  # Diferencia con Grupos de Seguridad:
+  #   - NACLs: aplican a la SUBRED, son stateless (sin estado), el trafico de
+  #            retorno debe permitirse explicitamente
+  #   - Grupos de Seguridad: aplican a la INSTANCIA, son stateful (con estado),
+  #            el trafico de retorno se permite automaticamente
+  #
+  # Las reglas se evaluan en orden ASCENDENTE (menor numero primero).
+  # La primera regla que coincide se aplica y se detiene la evaluacion.
+  # ============================================================================
+
+  # --- NACL Publica ---
+  # Controla el trafico que entra y sale de las subredes publicas
+  NACLPublica:
     Type: AWS::EC2::NetworkAcl
     Properties:
-       VpcId: !Ref MyVPC
-       Tags:
-       - Key: Name
-         Value: Public-Nacl
+      VpcId: !Ref MiVPC
+      Tags:
+        - Key: Name
+          Value: MTIC206-T1-NACL-Publica
+        - Key: Curso
+          Value: !Ref Etiqueta
 
-  publicInboundRule:
+  # Regla 90 (entrada): permite todo el trafico TCP de retorno
+  # Los puertos efimeros (1024-65535) son los que usa el sistema para respuestas
+  # Esto es necesario porque NACLs son stateless: el trafico de respuesta
+  # debe permitirse explicitamente para que las conexiones funcionen
+  NACLPublicaEntradaEfimeros:
     Type: AWS::EC2::NetworkAclEntry
     Properties:
-       NetworkAclId: !Ref MyPublicNACL
-       RuleNumber: 100
-       Protocol: 6
-       RuleAction: allow
-       CidrBlock: 0.0.0.0/0
-       PortRange:
-         From: 22
-         To: 22
+      NetworkAclId: !Ref NACLPublica
+      RuleNumber: 90
+      Protocol: 6      # 6 = TCP
+      RuleAction: allow
+      Egress: false    # false = regla de ENTRADA (inbound)
+      CidrBlock: 0.0.0.0/0
+      PortRange:
+        From: 1024
+        To: 65535
 
-  publicInboundRule2:
+  # Regla 100 (entrada): permite SSH desde cualquier IP
+  # Puerto 22 = SSH. En produccion se recomienda restringir a tu IP especifica.
+  NACLPublicaEntradaSSH:
     Type: AWS::EC2::NetworkAclEntry
     Properties:
-       NetworkAclId: !Ref MyPublicNACL
-       RuleNumber: 99
-       Protocol: -1
-       RuleAction: allow
-       CidrBlock: 0.0.0.0/0
+      NetworkAclId: !Ref NACLPublica
+      RuleNumber: 100
+      Protocol: 6      # 6 = TCP
+      RuleAction: allow
+      Egress: false    # Regla de ENTRADA
+      CidrBlock: 0.0.0.0/0   # Desde cualquier IP (para el taller esta bien)
+      PortRange:
+        From: 22
+        To: 22
 
-  publicOutboundRule:
+  # Regla 110 (entrada): permite trafico HTTP
+  NACLPublicaEntradaHTTP:
     Type: AWS::EC2::NetworkAclEntry
     Properties:
-       NetworkAclId: !Ref MyPublicNACL
-       RuleNumber: 100
-       Protocol: -1
-       Egress: true
-       RuleAction: allow
-       CidrBlock: 0.0.0.0/0
-
-  publicSubnet1NetworkAclAssociation:
-    Type: AWS::EC2::SubnetNetworkAclAssociation
-    Properties:
-       SubnetId: !Ref PublicSubnet1
-       NetworkAclId: !Ref MyPublicNACL
-
-  publicSubnet2NetworkAclAssociation:
-    Type: AWS::EC2::SubnetNetworkAclAssociation
-    Properties:
-       SubnetId: !Ref PublicSubnet2
-       NetworkAclId: !Ref MyPublicNACL
-  
-  MyPrivateNACL:
-    Type: AWS::EC2::NetworkAcl
-    Properties:
-       VpcId: !Ref MyVPC
-       Tags:
-       - Key: Name
-         Value: Private-Nacl
-
-  privateInboundRule:
-    Type: AWS::EC2::NetworkAclEntry
-    Properties:
-       NetworkAclId: !Ref MyPrivateNACL
-       RuleNumber: 100
-       Protocol: 6
-       RuleAction: allow
-       CidrBlock: 10.0.1.0/24
-       PortRange:
-         From: 22
-         To: 22
-
-  privateInboundHTTPNACL:
-    Type: AWS::EC2::NetworkAclEntry
-    Properties:
-      NetworkAclId: !Ref MyPrivateNACL
-      RuleNumber: 99
+      NetworkAclId: !Ref NACLPublica
+      RuleNumber: 110
       Protocol: 6
       RuleAction: allow
       Egress: false
@@ -335,11 +597,12 @@ Resources:
         From: 80
         To: 80
 
-  privateInboundHTTPSNACL:
+  # Regla 120 (entrada): permite trafico HTTPS
+  NACLPublicaEntradaHTTPS:
     Type: AWS::EC2::NetworkAclEntry
     Properties:
-      NetworkAclId: !Ref MyPrivateNACL
-      RuleNumber: 98
+      NetworkAclId: !Ref NACLPublica
+      RuleNumber: 120
       Protocol: 6
       RuleAction: allow
       Egress: false
@@ -348,216 +611,432 @@ Resources:
         From: 443
         To: 443
 
-  privateOutboundRule:
+  # Regla 100 (salida): permite todo el trafico de salida
+  # Protocol: -1 significa TODOS los protocolos
+  NACLPublicaSalida:
     Type: AWS::EC2::NetworkAclEntry
     Properties:
-       NetworkAclId: !Ref MyPrivateNACL
-       RuleNumber: 100
-       Protocol: -1
-       Egress: true
-       RuleAction: allow
-       CidrBlock: 0.0.0.0/0
+      NetworkAclId: !Ref NACLPublica
+      RuleNumber: 100
+      Protocol: -1     # -1 = todos los protocolos
+      RuleAction: allow
+      Egress: true     # true = regla de SALIDA (outbound)
+      CidrBlock: 0.0.0.0/0
 
-  privateSubnet1NetworkAclAssociation:
+  # Asociar Subred Publica 1 con la NACL Publica
+  AsociacionNACLPublica1:
     Type: AWS::EC2::SubnetNetworkAclAssociation
     Properties:
-       SubnetId: !Ref PrivateSubnet1
-       NetworkAclId: !Ref MyPrivateNACL
+      SubnetId: !Ref SubredPublica1
+      NetworkAclId: !Ref NACLPublica
 
-  privateSubnet2NetworkAclAssociation:
+  # Asociar Subred Publica 2 con la NACL Publica
+  AsociacionNACLPublica2:
     Type: AWS::EC2::SubnetNetworkAclAssociation
     Properties:
-       SubnetId: !Ref PrivateSubnet2
-       NetworkAclId: !Ref MyPrivateNACL
+      SubnetId: !Ref SubredPublica2
+      NetworkAclId: !Ref NACLPublica
 
-  PublicSecurityGroup:
+
+  # --- NACL Privada ---
+  # Controla el trafico de las subredes privadas.
+  # Mas restrictiva: SSH solo permitido desde la subred publica del Bastion.
+  NACLPrivada:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref MiVPC
+      Tags:
+        - Key: Name
+          Value: MTIC206-T1-NACL-Privada
+        - Key: Curso
+          Value: !Ref Etiqueta
+
+  # Regla 90 (entrada): permite puertos efimeros para respuestas TCP
+  # Necesario para recibir respuestas de internet (via NAT) y de la VPC
+  NACLPrivadaEntradaEfimeros:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref NACLPrivada
+      RuleNumber: 90
+      Protocol: 6
+      RuleAction: allow
+      Egress: false
+      CidrBlock: 0.0.0.0/0
+      PortRange:
+        From: 1024
+        To: 65535
+
+  # Regla 100 (entrada): SSH SOLO desde la Subred Publica 1 donde esta el Bastion
+  # Esta es la regla clave de seguridad: nadie de internet puede hacer SSH
+  # directamente a los servidores privados. Solo puede hacerlo el Bastion Host.
+  NACLPrivadaEntradaSSHDesdeBastion:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref NACLPrivada
+      RuleNumber: 100
+      Protocol: 6
+      RuleAction: allow
+      Egress: false
+      CidrBlock: !Ref SubredPublica1CIDR   # Solo desde la subred del Bastion (10.0.1.0/24)
+      PortRange:
+        From: 22
+        To: 22
+
+  # Regla 110 (entrada): HTTP permitido (para actualizaciones via NAT)
+  NACLPrivadaEntradaHTTP:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref NACLPrivada
+      RuleNumber: 110
+      Protocol: 6
+      RuleAction: allow
+      Egress: false
+      CidrBlock: 0.0.0.0/0
+      PortRange:
+        From: 80
+        To: 80
+
+  # Regla 120 (entrada): HTTPS permitido (para actualizaciones via NAT)
+  NACLPrivadaEntradaHTTPS:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref NACLPrivada
+      RuleNumber: 120
+      Protocol: 6
+      RuleAction: allow
+      Egress: false
+      CidrBlock: 0.0.0.0/0
+      PortRange:
+        From: 443
+        To: 443
+
+  # Regla 100 (salida): permite todo el trafico de salida de las privadas
+  # Las instancias privadas necesitan salir para actualizarse via NAT
+  NACLPrivadaSalida:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref NACLPrivada
+      RuleNumber: 100
+      Protocol: -1
+      RuleAction: allow
+      Egress: true
+      CidrBlock: 0.0.0.0/0
+
+  # Asociar Subred Privada 1 con la NACL Privada
+  AsociacionNACLPrivada1:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref SubredPrivada1
+      NetworkAclId: !Ref NACLPrivada
+
+  # Asociar Subred Privada 2 con la NACL Privada
+  AsociacionNACLPrivada2:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref SubredPrivada2
+      NetworkAclId: !Ref NACLPrivada
+
+
+  # ============================================================================
+  # BLOQUE 8: Security Groups (Grupos de Seguridad)
+  # ¿Que son? Firewalls a nivel de INSTANCIA EC2.
+  # A diferencia de las NACLs (que son stateless), los Security Groups son
+  # STATEFUL: si permitis trafico entrante, el trafico de respuesta saliente
+  # se permite automaticamente (y viceversa).
+  #
+  # Por defecto:
+  #   - Todo el trafico de entrada esta BLOQUEADO (hay que permitir explicitamente)
+  #   - Todo el trafico de salida esta PERMITIDO
+  # ============================================================================
+
+  # --- Grupo de Seguridad Publico ---
+  # Para instancias en subredes publicas (Bastion y Servidor Publico)
+  GrupoSegPublico:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupName: !Join ["-", ["public", !Ref SecurityGroupSuffix]]
-      GroupDescription: "Permite trafico entrante HTTP, HTTPS y SSH"
-      VpcId: !Ref MyVPC
+      GroupName: !Join ["-", ["MTIC206-T1", "publico", !Ref SufijoGrupoSeguridad]]
+      GroupDescription: "Permite HTTP, HTTPS y SSH de entrada para instancias publicas"
+      VpcId: !Ref MiVPC
       SecurityGroupIngress:
+        # Permite HTTP desde cualquier IP (para el servidor web)
         - IpProtocol: tcp
           FromPort: 80
           ToPort: 80
           CidrIp: 0.0.0.0/0
+          Description: "HTTP desde internet"
+        # Permite HTTPS desde cualquier IP
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
           CidrIp: 0.0.0.0/0
+          Description: "HTTPS desde internet"
+        # Permite SSH desde cualquier IP (en produccion deberias restringir a tu IP)
         - IpProtocol: tcp
           FromPort: 22
           ToPort: 22
           CidrIp: 0.0.0.0/0
+          Description: "SSH desde internet (para el taller; en produccion restringir a tu IP)"
+      # SecurityGroupEgress por defecto permite todo el trafico de salida.
+      # Se puede dejar sin definir explicitamente.
       Tags:
         - Key: Name
-          Value: sg-publico
-        - Key: myTag
-          Value: !Ref myTag
-    
-  PrivateSecurityGroup:
+          Value: MTIC206-T1-SG-Publico
+        - Key: Curso
+          Value: !Ref Etiqueta
+
+  # --- Grupo de Seguridad Privado ---
+  # Para instancias en subredes privadas
+  # Solo permite SSH desde el Grupo de Seguridad Publico (del Bastion)
+  GrupoSegPrivado:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupName: !Join ["-", ["private", !Ref SecurityGroupSuffix]]
-      GroupDescription: "Permite trafico entrante HTTP, HTTPS y SSH"
-      VpcId: !Ref MyVPC
+      GroupName: !Join ["-", ["MTIC206-T1", "privado", !Ref SufijoGrupoSeguridad]]
+      GroupDescription: "Permite HTTP, HTTPS y SSH solo desde la subred publica (Bastion)"
+      VpcId: !Ref MiVPC
       SecurityGroupIngress:
+        # HTTP permitido para posibles pruebas internas
         - IpProtocol: tcp
           FromPort: 80
           ToPort: 80
-          CidrIp: 0.0.0.0/0
+          CidrIp: !Ref VpcCIDR        # Solo desde dentro de la VPC
+          Description: "HTTP solo desde dentro de la VPC"
+        # HTTPS permitido internamente
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
-          CidrIp: 0.0.0.0/0
+          CidrIp: !Ref VpcCIDR
+          Description: "HTTPS solo desde dentro de la VPC"
+        # SSH solo desde el Grupo de Seguridad Publico (donde esta el Bastion)
+        # Esta es la configuracion mas segura: usar referencia al SG en lugar de CIDR
         - IpProtocol: tcp
           FromPort: 22
           ToPort: 22
-          CidrIp: 0.0.0.0/0
+          SourceSecurityGroupId: !Ref GrupoSegPublico   # Solo el Bastion puede hacer SSH
+          Description: "SSH solo desde el Bastion Host (SG publico)"
       Tags:
         - Key: Name
-          Value: sg-privado
-        - Key: myTag
-          Value: !Ref myTag
-  
-  # ============================================================================
-  # CAMBIO SEGURO APLICADO AQUÍ: Estructura puramente jerárquica para el editor
-  # ============================================================================
-  MyBastionServer:
-    Type: AWS::EC2::Instance
-    DependsOn: PublicSecurityGroup
-    Properties:
-      SubnetId: !Ref PublicSubnet1
-      ImageId: !Ref AmiID
-      InstanceType: !Ref TypeOfInstance
-      KeyName: !Ref KeyPairName
-      SecurityGroupIds:
-        - !Ref PublicSecurityGroup
-      IamInstanceProfile:
-        Ref: ListS3BucketsInstanceProfile
-      Tags:
-        - Key: Name
-          Value: Servidor-Bastion
-        - Key: myTag
-          Value: !Ref myTag
-      UserData:
-        Fn::Base64:
-          Fn::Sub: |
-            #!/bin/bash
-            yum update -y
-            yum install -y httpd
-            systemctl start httpd.service
-            systemctl enable httpd.service
-            echo "<h1>Hola desde el Bastion Server (Subred Publica 1)</h1>" > /var/www/html/index.html
-  
-  MyPrivateServer1:
-    Type: AWS::EC2::Instance
-    DependsOn: PrivateSecurityGroup
-    Properties:
-      SubnetId: !Ref PrivateSubnet1
-      ImageId: !Ref AmiID
-      InstanceType: !Ref TypeOfInstance
-      KeyName: !Ref KeyPairName
-      IamInstanceProfile:
-        Ref: ListS3BucketsInstanceProfile
-      SecurityGroupIds:
-        - !Ref PrivateSecurityGroup
-      Tags:
-        - Key: Name
-          Value: Servidor-Privado-1
-        - Key: myTag
-          Value: !Ref myTag
-      UserData:
-        Fn::Base64:
-          Fn::Sub: |
-            #!/bin/bash
-            yum update -y
-            yum install -y httpd
-            systemctl start httpd.service
-            systemctl enable httpd.service
-            echo "<h1>Hola desde el Servidor Privado 1</h1>" > /var/www/html/index.html
-            yum install -y python3
-  
-  MyPublicServer:
-    Type: AWS::EC2::Instance
-    DependsOn: PublicSecurityGroup
-    Properties:
-      SubnetId: !Ref PublicSubnet2
-      ImageId: !Ref AmiID
-      InstanceType: !Ref TypeOfInstance
-      KeyName: !Ref KeyPairName
-      SecurityGroupIds:
-        - !Ref PublicSecurityGroup
-      Tags:
-        - Key: Name
-          Value: Servidor-Publico-2
-        - Key: myTag
-          Value: !Ref myTag
-      UserData:
-        Fn::Base64:
-          Fn::Sub: |
-            #!/bin/bash
-            yum update -y
-            yum install -y httpd
-            systemctl start httpd.service
-            systemctl enable httpd.service
-            echo "<h1>Hola desde el Servidor Publico 2</h1>" > /var/www/html/index.html
-  
-  MyPrivateServer2:
-    Type: AWS::EC2::Instance
-    DependsOn: PrivateSecurityGroup
-    Properties:
-      SubnetId: !Ref PrivateSubnet2
-      ImageId: !Ref AmiID
-      InstanceType: !Ref TypeOfInstance
-      KeyName: !Ref KeyPairName
-      SecurityGroupIds:
-        - !Ref PrivateSecurityGroup
-      Tags:
-        - Key: Name
-          Value: Servidor-Privado-2
-        - Key: myTag
-          Value: !Ref myTag
-      UserData:
-        Fn::Base64:
-          Fn::Sub: |
-            #!/bin/bash
-            yum update -y
-            yum install -y httpd
-            systemctl start httpd.service
-            systemctl enable httpd.service
-            echo "<h1>Hola desde el Servidor Privado 2</h1>" > /var/www/html/index.html
-            yum install -y mariadb105-server
-            systemctl start mariadb
+          Value: MTIC206-T1-SG-Privado
+        - Key: Curso
+          Value: !Ref Etiqueta
 
-# ==============================================================================
-# SECCIÓN DE OUTPUTS
-# ==============================================================================
+
+  # ============================================================================
+  # BLOQUE 9: Instancias EC2
+  # ¿Que son? Servidores virtuales en la nube de AWS.
+  # En este taller creamos 4 instancias:
+  #   1. Bastion Host (publica 1): punto de acceso SSH a los servidores privados
+  #   2. Servidor Publico 2 (publica 2): servidor web en la subred publica 2
+  #   3. Servidor Privado 1 (privada 1): servidor en subred privada, aislado
+  #   4. Servidor Privado 2 (privada 2): servidor en subred privada, aislado
+  #
+  # UserData: script de bash que se ejecuta automaticamente al iniciar la instancia.
+  #           Se usa para instalar y configurar software en el primer arranque.
+  # ============================================================================
+
+  # --- Bastion Host (en Subred Publica 1) ---
+  # El Bastion Host es el "salto" para acceder a los servidores privados.
+  # Tiene IP publica, y desde el haces SSH a los servidores privados.
+  # Tambien tiene el rol IAM para listar buckets de S3 (demostracion de permisos).
+  ServidorBastion:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - GrupoSegPublico        # El SG debe existir antes que la instancia
+      - PerfilInstancia         # El perfil IAM debe existir antes
+      - ConexionIGWaVPC        # El IGW debe estar adjunto para que la IP publica funcione
+    Properties:
+      SubnetId: !Ref SubredPublica1           # Va en la subred publica 1
+      ImageId: !Ref AmiID                     # Amazon Linux 2023 (via SSM)
+      InstanceType: !Ref TipoDeInstancia      # t3.micro por defecto
+      KeyName: !Ref NombreDelKeyPair          # Key Pair para SSH
+      SecurityGroupIds:
+        - !Ref GrupoSegPublico                # Usa el grupo de seguridad publico
+      IamInstanceProfile: !Ref PerfilInstancia  # Rol IAM para listar S3
+      Tags:
+        - Key: Name
+          Value: MTIC206-T1-Bastion
+        - Key: Tipo
+          Value: Bastion-Publico
+        - Key: Curso
+          Value: !Ref Etiqueta
+      UserData:
+        # Fn::Base64 convierte el script a Base64, que es como EC2 espera recibir el UserData
+        # !Sub permite usar variables del template dentro del script (${Variable})
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # Script de inicializacion del Bastion Host
+          # Se ejecuta una sola vez cuando la instancia arranca por primera vez
+
+          # Actualizar todos los paquetes instalados
+          dnf update -y
+
+          # Instalar el servidor web Apache (httpd)
+          dnf install -y httpd
+
+          # Iniciar el servicio de Apache
+          systemctl start httpd
+
+          # Configurar Apache para que inicie automaticamente en cada reinicio
+          systemctl enable httpd
+
+          # Crear una pagina web de prueba que identifica este servidor
+          echo "<h1>Hola desde el Bastion Host — MTIC206 Taller 1</h1>
+          <p>Subred: Publica 1 | Tipo: Bastion Host</p>
+          <p>Stack: ${AWS::StackName}</p>" > /var/www/html/index.html
+
+  # --- Servidor Publico 2 (en Subred Publica 2) ---
+  # Otro servidor en la subred publica. Tambien accesible desde internet.
+  # A diferencia del Bastion, este no tiene rol IAM (no necesita acceder a S3).
+  ServidorPublico2:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - GrupoSegPublico
+      - ConexionIGWaVPC
+    Properties:
+      SubnetId: !Ref SubredPublica2           # Va en la subred publica 2
+      ImageId: !Ref AmiID
+      InstanceType: !Ref TipoDeInstancia
+      KeyName: !Ref NombreDelKeyPair
+      SecurityGroupIds:
+        - !Ref GrupoSegPublico
+      Tags:
+        - Key: Name
+          Value: MTIC206-T1-Servidor-Publico-2
+        - Key: Tipo
+          Value: Servidor-Publico
+        - Key: Curso
+          Value: !Ref Etiqueta
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          dnf update -y
+          dnf install -y httpd
+          systemctl start httpd
+          systemctl enable httpd
+          echo "<h1>Hola desde el Servidor Publico 2 — MTIC206 Taller 1</h1>
+          <p>Subred: Publica 2 | Stack: ${AWS::StackName}</p>" > /var/www/html/index.html
+
+  # --- Servidor Privado 1 (en Subred Privada 1) ---
+  # Este servidor NO tiene IP publica. Solo se puede acceder via SSH
+  # desde el Bastion Host. Puede salir a internet via el NAT Gateway.
+  ServidorPrivado1:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - GrupoSegPrivado
+      - MiNATGateway           # El NAT debe existir para que el servidor pueda actualizarse
+      - PerfilInstancia
+    Properties:
+      SubnetId: !Ref SubredPrivada1           # Va en la subred privada 1
+      ImageId: !Ref AmiID
+      InstanceType: !Ref TipoDeInstancia
+      KeyName: !Ref NombreDelKeyPair
+      SecurityGroupIds:
+        - !Ref GrupoSegPrivado                # Usa el grupo de seguridad privado
+      IamInstanceProfile: !Ref PerfilInstancia  # Rol para acceder a S3 desde dentro
+      Tags:
+        - Key: Name
+          Value: MTIC206-T1-Servidor-Privado-1
+        - Key: Tipo
+          Value: Servidor-Privado
+        - Key: Curso
+          Value: !Ref Etiqueta
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # Este servidor esta en una subred privada.
+          # Las actualizaciones van a traves del NAT Gateway.
+          dnf update -y
+          dnf install -y httpd
+          systemctl start httpd
+          systemctl enable httpd
+          echo "<h1>Hola desde el Servidor Privado 1 — MTIC206 Taller 1</h1>
+          <p>Subred: Privada 1 | Sin IP publica | Stack: ${AWS::StackName}</p>" > /var/www/html/index.html
+
+  # --- Servidor Privado 2 (en Subred Privada 2) ---
+  # Similar al Servidor Privado 1 pero en la segunda Zona de Disponibilidad.
+  ServidorPrivado2:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - GrupoSegPrivado
+      - MiNATGateway
+    Properties:
+      SubnetId: !Ref SubredPrivada2           # Va en la subred privada 2
+      ImageId: !Ref AmiID
+      InstanceType: !Ref TipoDeInstancia
+      KeyName: !Ref NombreDelKeyPair
+      SecurityGroupIds:
+        - !Ref GrupoSegPrivado
+      Tags:
+        - Key: Name
+          Value: MTIC206-T1-Servidor-Privado-2
+        - Key: Tipo
+          Value: Servidor-Privado
+        - Key: Curso
+          Value: !Ref Etiqueta
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          dnf update -y
+          dnf install -y httpd
+          systemctl start httpd
+          systemctl enable httpd
+          echo "<h1>Hola desde el Servidor Privado 2 — MTIC206 Taller 1</h1>
+          <p>Subred: Privada 2 | Sin IP publica | Stack: ${AWS::StackName}</p>" > /var/www/html/index.html
+
+
+# =============================================================================
+# SECCION: Outputs (Salidas)
+# USO: Muestra informacion util sobre los recursos creados una vez que
+#      el stack se despliega exitosamente. Aparece en la consola de
+#      CloudFormation bajo la pestana "Outputs" del stack.
+#      Tambien pueden usarse para pasar valores a otros stacks (cross-stack).
+# =============================================================================
 Outputs:
-  VpcId:
-    Description: ID de la VPC creada
-    Value: !Ref MyVPC
-    
-  PrivateServer1InstanceId:
-    Description: InstanceId del Servidor Privado 1
-    Value: !Ref MyPrivateServer1
 
-  PrivateServer2InstanceId:
-    Description: InstanceId del Servidor Privado 2
-    Value: !Ref MyPrivateServer2
+  # ID de la VPC creada
+  IDdelaVPC:
+    Description: ID de la VPC creada para MTIC206 Taller 1
+    Value: !Ref MiVPC
+    Export:
+      Name: !Sub "${AWS::StackName}-VPC-ID"   # Exporta el valor para otros stacks
 
-  BastionInstanceId:
-    Description: InstanceId del Bastion Server
-    Value: !Ref MyBastionServer
+  # URL del Bastion Host (para probar el servidor web)
+  URLBastionHost:
+    Description: URL HTTP del Bastion Host (servidor web en subred publica 1)
+    Value: !Sub "http://${ServidorBastion.PublicIp}"
 
-  BastionPublicIP:
-    Description: IP Publica del Bastion Server (Usa esta para conectarte por SSH)
-    Value: !GetAtt MyBastionServer.PublicIp
+  # IP publica del Bastion Host (para conectarse por SSH)
+  IPPublicaBastion:
+    Description: IP publica del Bastion Host para conexion SSH
+    Value: !GetAtt ServidorBastion.PublicIp
 
-  PublicInstanceId:
-    Description: InstanceId del Servidor Publico 2
-    Value: !Ref MyPublicServer
+  # Comando SSH para conectarse al Bastion
+  ComandoSSHBastion:
+    Description: Comando SSH para conectarse al Bastion Host
+    Value: !Sub "ssh -i ${NombreDelKeyPair}.pem ec2-user@${ServidorBastion.PublicIp}"
 
-  PublicServerPublicIP:
-    Description: IP Publica del Servidor Publico 2
-    Value: !GetAtt MyPublicServer.PublicIp
+  # URL del Servidor Publico 2
+  URLServidorPublico2:
+    Description: URL HTTP del Servidor Publico 2
+    Value: !Sub "http://${ServidorPublico2.PublicIp}"
+
+  # IP privada del Servidor Privado 1 (para hacer SSH desde el Bastion)
+  IPPrivadaServidor1:
+    Description: IP privada del Servidor Privado 1 (usala para SSH desde el Bastion)
+    Value: !GetAtt ServidorPrivado1.PrivateIp
+
+  # IP privada del Servidor Privado 2
+  IPPrivadaServidor2:
+    Description: IP privada del Servidor Privado 2 (usala para SSH desde el Bastion)
+    Value: !GetAtt ServidorPrivado2.PrivateIp
+
+  # ID del Stack para referencia
+  NombreDelStack:
+    Description: Nombre del stack de CloudFormation
+    Value: !Ref AWS::StackName
+
+  # Instrucciones de acceso a privados (recordatorio)
+  InstruccionesAccesoPrivado:
+    Description: Como acceder a los servidores privados
+    Value: !Sub >
+      1) SSH al Bastion: ssh -i ${NombreDelKeyPair}.pem ec2-user@${ServidorBastion.PublicIp}
+      2) Desde el Bastion: ssh -i ${NombreDelKeyPair}.pem ec2-user@${ServidorPrivado1.PrivateIp}
